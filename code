@@ -1,0 +1,796 @@
+#include <WiFi.h>
+#include <ThingerESP32.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <ESP32Servo.h>
+#include <WiFiClientSecure.h>      
+#include <UniversalTelegramBot.h>  
+#include <ArduinoJson.h>
+#include <time.h> 
+
+// ================== KONFIGURASI THINGER ==================
+#define USERNAME "Yunew"
+#define DEVICE_ID "trashbin"
+#define DEVICE_CREDENTIAL "eZ!o#%eT&ASo9jD#"
+
+#define SSID "yn's"
+#define PASS "0987654321"
+
+ThingerESP32 thing(USERNAME, DEVICE_ID, DEVICE_CREDENTIAL);
+
+// ================== TOKENS BOT TELEGRAM ==================
+#define BOT_WARGA_TOKEN "8619507686:AAEGHXK-n6PVUlrtkM0hyEbrUi_wwXpq0T8"  
+#define BOT_STAFF_TOKEN "8978855574:AAG0wKzlhQMGRYAHDA25O6399yS-NHKLa-A"  
+
+WiFiClientSecure clientWarga, clientStaff;
+UniversalTelegramBot botWarga(BOT_WARGA_TOKEN, clientWarga);
+UniversalTelegramBot botStaff(BOT_STAFF_TOKEN, clientStaff);
+
+// ================== KONFIGURASI TPS ==================
+const int TINGGI_MAX_TPS = 30; 
+unsigned long waktuTerakhirCekBot;
+const unsigned long INTERVAL_CEK_BOT = 2000; 
+
+String chatIDStaffTujuan = ""; 
+bool notifPenuhTerkirim = false;
+const String PASSWORD_STAFF = "TPSSAMARINDA2026";
+
+String staffTerdaftar[3];
+int jumlahStaff = 0;
+
+bool modeInputPassword = false;
+String chatIDMenungguPassword = "";
+
+// ================== PIN BARU (DISESUAIKAN) ==================
+#define TRIG_PENUH 5
+#define ECHO_PENUH 18
+#define TRIG_MANUSIA 14
+#define ECHO_MANUSIA 27
+#define PIR_PIN 12
+#define LED 2
+#define SERVO_PIN 13
+
+// ================== OBJECT ==================
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+//LiquidCrystal_I2C lcd(0x3F, 16, 2);
+Servo servo;
+
+// ================== VARIABEL ==================
+int jarakPenuh;
+int jarakManusia;
+int persentaseIsi = 0;
+String statusTPS = "BUKA"; 
+
+bool status_tutup = true;
+bool sudahTerbuka = false;
+
+unsigned long waktuServoBuka = 0;
+const unsigned long JEDA_SERVO_TERBUKA = 3000; 
+unsigned long waktuTerakhirDeteksi = 0;
+
+// Tambahan Variabel untuk Kontrol Manual dari Thinger.io
+bool modeManualThinger = false; 
+
+// Fungsi cek jam operasional (18.00 s.d 06.00 WITA)
+bool apakahJamOperasional() {
+  time_t now = time(nullptr);
+  struct tm* timeInfo = localtime(&now);
+  int jamSekarang = timeInfo->tm_hour; 
+
+  if (jamSekarang >= 18 || jamSekarang < 6) {
+    return true;
+  }
+  return false;
+}
+
+// Fungsi format jam digital untuk laporan teks Telegram
+String getWaktuSekarangStr() {
+  time_t now = time(nullptr);
+  struct tm* timeInfo = localtime(&now);
+  char buf[10];
+  sprintf(buf, "%02d:%02d", timeInfo->tm_hour, timeInfo->tm_min);
+  return String(buf);
+}
+
+// Fungsi membaca sensor Ultrasonik
+int bacaUltrasonik(int trigPin, int echoPin) {
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+  
+  long duration = pulseIn(echoPin, HIGH, 30000); 
+  if (duration == 0) return 999; 
+  return duration * 0.034 / 2;
+}
+
+// ================== LOGIKA BOT 1: LAYANAN MASYARAKAT (TOMBOL AKTIF) ==================
+void cekBotWarga() {
+  Serial.println("-> Memeriksa pesan masuk Bot Warga...");
+  int numNewMessages = botWarga.getUpdates(botWarga.last_message_received + 1);
+
+  while (numNewMessages) {
+    for (int i = 0; i < numNewMessages; i++) {
+      String chat_id = String(botWarga.messages[i].chat_id);
+      String text = botWarga.messages[i].text;
+      String namaUser = botWarga.messages[i].from_name;
+      String type = botWarga.messages[i].type;
+
+      // Susunan Baris Tombol Utama Warga
+      String tombolUtamaWarga = "[["
+                                "{\"text\":\"📊 Cek Status TPS\", \"callback_data\":\"warga_cek\"},"
+                                "{\"text\":\"📋 Aturan Jadwal\", \"callback_data\":\"warga_jadwal\"}"
+                                "]]";
+
+      // 1. JIKA MENERIMA TEKS BIASA (/start atau /help)
+      if (type == "message") {
+        if (text == "/start" || text == "/help") {
+          String selamatDatang = "Halo " + namaUser + ", Warga Samarinda!\n\n";
+          selamatDatang += "Selamat datang di Sistem Informasi Layanan TPS Kota Samarinda.\n\n";
+          selamatDatang += "Silakan tekan tombol di bawah ini untuk berinteraksi:";
+          
+          botWarga.sendMessageWithInlineKeyboard(chat_id, selamatDatang, "Markdown", tombolUtamaWarga);
+        }
+      }
+      
+      // 2. JIKA MENERIMA KLIK TOMBOL (CALLBACK QUERY)
+      else if (type == "callback_query") {
+        if (text == "warga_jadwal") {
+          String infoJadwal = "📋 *JADWAL OPERASIONAL TPS SAMARINDA*\n\n";
+          infoJadwal += "Masyarakat diwajibkan membuang sampah pada:\n";
+          infoJadwal += "⏰ *Jam: 18.00 s.d. 06.00 WITA*\n\n";
+          infoJadwal += "Mari tertib demi Samarinda yang Bersih dan Teduh! 💚";
+
+          String tombolKembali = "[[{\"text\":\"⬅️ Kembali ke Menu Utama\", \"callback_data\":\"warga_main\"}]]";
+          // PERBAIKAN: Mengirim pesan baru dengan fungsi yang pasti ada di library kamu
+          botWarga.sendMessageWithInlineKeyboard(chat_id, infoJadwal, "Markdown", tombolKembali);
+        }
+        
+        else if (text == "warga_cek") {
+          String infoTPS = "📍 *STATUS AKTIVITAS TPS SAMARINDA*\n\n";
+          infoTPS += "1. TPS Pasar Segiri - [DEVICE 1]\n";
+          infoTPS += " - Jam Operasional: 18.00 - 06.00 WITA\n";
+          infoTPS += " - Waktu Saat Ini: " + getWaktuSekarangStr() + " WITA\n";
+          infoTPS += " - Kapasitas Bak: " + String(persentaseIsi) + "% Terisi\n";
+          infoTPS += " - Status Operasional: " + statusTPS + "\n";
+          
+          if (statusTPS == "TUTUP (PENUH)") {
+            infoTPS += " ⚠️ _Bak penuh, gerbang terkunci._\n";
+          } else if (statusTPS == "TUTUP (LUAR JAM OPERASIONAL)") {
+            infoTPS += " ⏳ _Di luar jam operasional Pemda._\n";
+          } else {
+            infoTPS += " ✅ _TPS siap digunakan._\n";
+          }
+          infoTPS += "\n";
+          infoTPS += "2. TPS Voorvo - [DEVICE 2]\n - Kapasitas: 35% | BUKA\n\n";
+          infoTPS += "3. TPS Loa Bakung - [DEVICE 3]\n - Kapasitas: 92% | TUTUP (PENUH)";
+
+          String tombolRefresh = "[["
+                                 "{\"text\":\"🔄 Segarkan Data\", \"callback_data\":\"warga_cek\"},"
+                                 "{\"text\":\"⬅️ Menu Utama\", \"callback_data\":\"warga_main\"}"
+                                 "]]";
+          // PERBAIKAN
+          botWarga.sendMessageWithInlineKeyboard(chat_id, infoTPS, "Markdown", tombolRefresh);
+        }
+        
+        else if (text == "warga_main") {
+          String selamatDatang = "Halo " + namaUser + ", Warga Samarinda!\n\nSilakan tekan tombol di bawah ini untuk berinteraksi:";
+          // PERBAIKAN
+          botWarga.sendMessageWithInlineKeyboard(chat_id, selamatDatang, "Markdown", tombolUtamaWarga);
+        }
+      }
+    }
+    numNewMessages = botWarga.getUpdates(botWarga.last_message_received + 1);
+  }
+}
+
+bool apakahStaffTerdaftar(String chat_id) {
+  for (int i = 0; i < jumlahStaff; i++) {
+    if (staffTerdaftar[i] == chat_id) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// ================== LOGIKA BOT 2: STAFF KEBERSIHAN (TOMBOL AKTIF) ==================
+void cekBotStaff() {
+  Serial.println("-> Memeriksa pesan masuk Bot Staff...");
+  int numNewMessages = botStaff.getUpdates(botStaff.last_message_received + 1);
+
+  while (numNewMessages) {
+    for (int i = 0; i < numNewMessages; i++) {
+      String chat_id = String(botStaff.messages[i].chat_id);
+      String text = botStaff.messages[i].text;
+      String type = botStaff.messages[i].type;
+
+      // Susunan Baris Tombol Dashboard Staff
+      String tombolStaff = "[[{\"text\":\"📊 Tarik Data Metrik Sensor\", \"callback_data\":\"staff_monitor\"}]]";
+
+      // 1. JIKA MENERIMA TEKS BIASA
+      if (type == "message") {
+        if (text == "/start" || text == "/reg_staff" || text == "/help_staff") {
+
+    // Kalau sudah pernah login
+    if (apakahStaffTerdaftar(chat_id)) {
+
+      chatIDStaffTujuan = chat_id;
+
+      String reply = "🛠️ *DASHBOARD OPERASIONAL INTERNAL STAFF*\n";
+      reply += "--------------------------------------\n";
+      reply += "ID Telegram Anda terverifikasi.\n\n";
+      reply += "Tekan tombol di bawah untuk memantau metrik.";
+
+      botStaff.sendMessageWithInlineKeyboard(
+        chat_id,
+        reply,
+        "Markdown",
+        tombolStaff
+      );
+    }
+
+    // Kalau belum login
+    else {
+
+      // Maksimal 3 akun
+      if (jumlahStaff >= 3) {
+
+        botStaff.sendMessage(
+          chat_id,
+          "❌ Kuota akses staff penuh.\nMaksimal hanya 3 device.",
+          ""
+        );
+      }
+
+      // Minta password
+      else {
+
+        modeInputPassword = true;
+        chatIDMenungguPassword = chat_id;
+
+        botStaff.sendMessage(
+          chat_id,
+          "🔐 Masukkan password staff:",
+          ""
+        );
+      }
+    }
+  }
+
+  // ===== CEK PASSWORD =====
+  else if (
+    modeInputPassword &&
+    chat_id == chatIDMenungguPassword
+  ) {
+
+    // PASSWORD BENAR
+    if (text == PASSWORD_STAFF) {
+
+      staffTerdaftar[jumlahStaff] = chat_id;
+      jumlahStaff++;
+
+      modeInputPassword = false;
+      chatIDMenungguPassword = "";
+
+      chatIDStaffTujuan = chat_id;
+
+      String sukses = "✅ Password benar!\n\n";
+      sukses += "Akses dashboard berhasil diberikan.";
+
+      botStaff.sendMessageWithInlineKeyboard(
+        chat_id,
+        sukses,
+        "Markdown",
+        tombolStaff
+      );
+    }
+
+    // PASSWORD SALAH
+    else {
+
+      botStaff.sendMessage(
+        chat_id,
+        "❌ Password salah.\nCoba lagi.",
+        ""
+      );
+    }
+  }
+}
+      
+      // 2. JIKA MENERIMA KLIK TOMBOL (CALLBACK QUERY)
+      else if (type == "callback_query") {
+        if (text == "staff_monitor") {
+          String dataStaff = "📊 *DASHBOARD METRIK SENSOR REAL-TIME*\n\n";
+          dataStaff += "📍 Lokasi: TPS Pasar Segiri (Device 1)\n";
+          dataStaff += " 🔹 Sensor Sampah: " + String(jarakPenuh) + " cm\n";
+          dataStaff += " 🔹 Sensor Manusia: " + String(jarakManusia) + " cm\n";
+          dataStaff += " 🔹 Status PIR: " + String(digitalRead(PIR_PIN) == HIGH ? "🔥 Gerakan Dideteksi" : "💤 Standby") + "\n";
+          dataStaff += " 🔹 Persentase Bak: *" + String(persentaseIsi) + "%*\n";
+          dataStaff += " 🔹 Kesimpulan Sistem: *" + statusTPS + "*\n";
+          dataStaff += " 🔹 Mekanik Servo: " + String(sudahTerbuka ? "🔓 TERBUKA" : "🔒 TERTUTUP") + "\n\n";
+          dataStaff += "⏱️ _Pembaruan terakhir: " + getWaktuSekarangStr() + " WITA_";
+
+          String tombolUpdateStaff = "[["
+                                     "{\"text\":\"🔄 Update Metrik\", \"callback_data\":\"staff_monitor\"},"
+                                     "{\"text\":\"⬅️ Menu Awal\", \"callback_data\":\"staff_back\"}"
+                                     "]]";
+          // PERBAIKAN
+          botStaff.sendMessageWithInlineKeyboard(chat_id, dataStaff, "Markdown", tombolUpdateStaff);
+        }
+        
+        else if (text == "staff_back") {
+          String reply = "🛠️ *DASHBOARD OPERASIONAL INTERNAL STAFF*\n--------------------------------------\nTekan tombol di bawah untuk memantau metrik secara berkala:";
+          // PERBAIKAN
+          botStaff.sendMessageWithInlineKeyboard(chat_id, reply, "Markdown", tombolStaff);
+        }
+      }
+    }
+    numNewMessages = botStaff.getUpdates(botStaff.last_message_received + 1);
+  }
+}
+
+// ================== SETUP ==================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("=========================================");
+  Serial.println("Sistem Smart TPS Dual-Bot Dimulai...");
+  Serial.println("=========================================");
+
+  pinMode(TRIG_PENUH, OUTPUT);
+  pinMode(ECHO_PENUH, INPUT);
+  pinMode(TRIG_MANUSIA, OUTPUT);
+  pinMode(ECHO_MANUSIA, INPUT);
+  pinMode(PIR_PIN, INPUT);
+  pinMode(LED, OUTPUT);
+
+  servo.setPeriodHertz(50);
+  servo.attach(SERVO_PIN, 500, 2400);
+  servo.write(0);
+
+  Wire.begin(21,22);
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(0,0);
+  lcd.print("TPS Pasar Segiri");
+  lcd.setCursor(0,1);
+  lcd.print("Multi-Sensor ON");
+  delay(2000);
+
+
+  Serial.print("Menghubungkan ke Wi-Fi: ");
+  WiFi.begin(SSID, PASS);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWi-Fi Terhubung!");
+
+  Serial.print("Menyelaraskan waktu sertifikat SSL Telegram... ");
+  configTime(8 * 3600, 0, "pool.ntp.org", "time.nist.gov"); 
+  time_t now = time(nullptr);
+  while (now < 24 * 3600) {
+    delay(500);
+    now = time(nullptr);
+  }
+  Serial.println("Waktu WITA Sinkron!");
+
+  clientWarga.setInsecure(); 
+  clientWarga.setHandshakeTimeout(30000); 
+  clientStaff.setInsecure();
+  clientStaff.setHandshakeTimeout(30000);
+
+  Serial.println("Mengaktifkan integrasi Thinger.io...");
+  thing.add_wifi(SSID, PASS);
+  
+  thing["monitor"] >> [](pson &out){
+    out["kapasitas_persen"] = persentaseIsi;
+    out["status_tps"] = statusTPS;
+    out["status_servo"] = sudahTerbuka ? "BUKA" : "TUTUP";
+  };
+
+  thing["tombol_buka"] << [](pson& in){
+    if(in.is_empty()){
+      in = false; 
+    } else {
+      bool pressed = in;
+      if(pressed) {
+        modeManualThinger = true; 
+        sudahTerbuka = true;
+        Serial.println("🔘 [Thinger.io] Tombol MANUAL BUKA Ditekan!");
+      }
+    }
+  };
+
+thing["tombol_tutup"] << [](pson& in){
+  if(in.is_empty()){
+    in = false;
+  } else {
+    bool pressed = in;
+
+    if(pressed) {
+
+      modeManualThinger = false;
+
+      servo.write(0);          // <-- tambahkan ini
+      digitalWrite(LED, LOW); // <-- biar LED ikut mati
+
+      sudahTerbuka = false;
+      status_tutup = true;
+
+      Serial.println("🔘 [Thinger.io] Tombol MANUAL TUTUP Ditekan!");
+    }
+   }
+};
+  Serial.println("Setup Selesai. Sistem Standby.");
+  }
+
+// ================== LOOP ==================
+void loop() {
+  thing.handle();
+
+  // ===== 1. AMBIL DATA SENSOR =====
+  jarakPenuh = bacaUltrasonik(TRIG_PENUH, ECHO_PENUH);
+  jarakManusia = bacaUltrasonik(TRIG_MANUSIA, ECHO_MANUSIA);
+  int statusPIR = digitalRead(PIR_PIN);
+
+  // ===== 2. KALKULASI KAPASITAS SAMPAH =====
+  int tempJarak = jarakPenuh;
+  if (tempJarak > TINGGI_MAX_TPS) tempJarak = TINGGI_MAX_TPS;
+  if (tempJarak < 5) tempJarak = 5; 
+  persentaseIsi = map(tempJarak, TINGGI_MAX_TPS, 5, 0, 100);
+
+  // ===== 3. LOGIKA EVALUASI STATUS OPERASIONAL TPS REAL-TIME =====
+  if (!apakahJamOperasional()) {
+    statusTPS = "TUTUP (LUAR JAM OPERASIONAL)";
+  } else if (persentaseIsi >= 80) {
+    statusTPS = "TUTUP (PENUH)";
+  } else {
+    statusTPS = "BUKA";
+  }
+
+  // --- PRINT DATA SENSOR KE SERIAL MONITOR ---
+  Serial.println("--- DATA REAL-TIME ---");
+  Serial.print("Kapasitas Sampah : "); Serial.print(persentaseIsi); Serial.println("%");
+  Serial.print("Status TPS       : "); Serial.println(statusTPS);
+  Serial.print("Mode Kontrol     : "); Serial.println(modeManualThinger ? "MANUAL (THINGER)" : "OTOMATIS SENSOR");
+  Serial.print("Status Mekanik   : "); Serial.println(sudahTerbuka ? "SERVO BUKA" : "SERVO TUTUP");
+  Serial.println("----------------------");
+  
+  Serial.print("Ultrasonik Sampah : ");
+  Serial.print(jarakPenuh);
+  Serial.println(" cm");
+
+  Serial.print("Ultrasonik Orang  : ");
+  Serial.print(jarakManusia);
+  Serial.println(" cm");
+
+  Serial.print("Status PIR        : ");
+  if(statusPIR == HIGH){
+    Serial.println("TERDETEKSI");
+  }else{
+    Serial.println("TIDAK TERDETEKSI");
+  }
+
+//   // ===== 4. LOGIKA KENDALI SERVO (DENGAN OVERRIDE MANUAL THINGER) =====
+//   if (modeManualThinger) {
+//     servo.write(90);
+//     digitalWrite(LED, HIGH);
+//     status_tutup = false;
+
+//     lcd.setCursor(0,0);
+//     lcd.print("KONTROL MANUAL  ");
+//     lcd.setCursor(0,1);
+//     lcd.print("SERVO: TERBUKA  ");
+//   } 
+//   else {
+//     if(statusPIR == HIGH && jarakManusia < 20 && !sudahTerbuka && statusTPS == "BUKA"){
+//       Serial.println("⚠️ [AKSI] Warga Mendekat & TPS Buka! Membuka Servo...");
+//       servo.write(90);
+//       digitalWrite(LED, HIGH);
+
+//       status_tutup = false;
+//       sudahTerbuka = true;
+//       waktuServoBuka = millis(); 
+
+//       lcd.clear();
+//       lcd.setCursor(0,0);
+//       lcd.print("Silakan Buang");
+//       lcd.setCursor(0,1);
+//       lcd.print("Sampah Anda");
+//     }
+//   else if(sudahTerbuka && !modeManualThinger && (jarakManusia >= 20 || (millis() - waktuServoBuka >= JEDA_SERVO_TERBUKA) ||statusTPS != "BUKA")){
+//   Serial.println("🔒 [AKSI] Menutup Kembali Servo...");
+  
+//   servo.write(0);
+//   digitalWrite(LED, LOW);
+
+//   status_tutup = true;
+//   sudahTerbuka = false;
+// }
+//       Serial.println("🔒 [AKSI] Menutup Kembali Servo...");
+//       servo.write(0);
+//       digitalWrite(LED, LOW);
+
+//       status_tutup = true;
+//       sudahTerbuka = false;
+//     }
+
+//    if(!sudahTerbuka) {
+
+//   lcd.setCursor(0,0);
+
+//   if (statusTPS == "TUTUP (PENUH)") {
+//     lcd.print("TPS PENUH      ");
+//   } 
+  
+//   else if (statusTPS == "TUTUP (LUAR JAM OPERASIONAL)") {
+//     lcd.print("TUTUP LUAR JAM ");
+//   } 
+  
+//   else {
+//     lcd.print("TPS SEGIRI          ");
+//   }
+
+//   lcd.setCursor(0,1);
+
+//   String baris2 = "Isi:" + String(persentaseIsi) + "%  ";
+
+//   if (persentaseIsi >= 80) {
+//     baris2 += "[FULL]";
+//   } else {
+//     baris2 += "[SEDIA]";
+//   }
+
+//   while(baris2.length() < 16){
+//     baris2 += " ";
+//   }
+
+//   lcd.print(baris2);
+//   }
+// ===== 4. LOGIKA KENDALI SERVO (STABIL) =====
+
+// ================= MODE MANUAL THINGER =================
+if (modeManualThinger) {
+
+  // Servo dibuka manual
+  servo.write(90);
+
+  // LED nyala stabil
+  digitalWrite(LED, HIGH);
+
+  status_tutup = false;
+  sudahTerbuka = true;
+
+  lcd.setCursor(0,0);
+  lcd.print("KONTROL MANUAL");
+  lcd.setCursor(0,1);
+  lcd.print("SERVO: TERBUKA");
+
+}
+
+// ================= MODE OTOMATIS =================
+else {
+
+  // ===== TPS PENUH =====
+  if (persentaseIsi >= 80) {
+
+    // Pastikan servo tertutup
+    servo.write(0);
+
+    sudahTerbuka = false;
+    status_tutup = true;
+
+    // LED menyala tanda penuh
+    digitalWrite(LED, HIGH);
+
+    lcd.setCursor(0,0);
+    lcd.print("TPS PENUH      ");
+
+    lcd.setCursor(0,1);
+    lcd.print("ANGKUT SAMPAH! ");
+
+  }
+
+  // ===== LUAR JAM OPERASIONAL =====
+  else if (!apakahJamOperasional()) {
+
+    servo.write(0);
+
+    sudahTerbuka = false;
+    status_tutup = true;
+
+    // LED mati
+    digitalWrite(LED, LOW);
+
+    lcd.setCursor(0,0);
+    lcd.print("TUTUP LUAR JAM");
+
+    lcd.setCursor(0,1);
+    lcd.print("06-18 SAJA    ");
+
+  }
+
+  // ===== TPS NORMAL =====
+  else {
+     // ================= BUKA SERVO =================
+     // Ada orang terdeteksi
+if(statusPIR == HIGH && jarakManusia < 20){
+
+  waktuTerakhirDeteksi = millis();
+
+  if(!sudahTerbuka){
+
+    Serial.println("⚠️ Membuka Servo...");
+
+    servo.write(90);
+
+    sudahTerbuka = true;
+    status_tutup = false;
+
+    lcd.clear();
+    lcd.setCursor(0,0);
+    lcd.print("Silakan Buang");
+    lcd.setCursor(0,1);
+    lcd.print("Sampah Anda");
+  }
+}
+
+// Tutup setelah tidak ada orang 5 detik
+if(
+   sudahTerbuka &&
+   millis() - waktuTerakhirDeteksi > 5000
+){
+   Serial.println("🔒 Menutup Servo...");
+
+   servo.write(0);
+
+   sudahTerbuka = false;
+   status_tutup = true;
+}
+//   if(statusPIR == HIGH &&
+//      jarakManusia < 20 &&
+//      !sudahTerbuka){
+
+//     Serial.println("⚠️ Membuka Servo...");
+
+//     servo.write(90);
+
+//     sudahTerbuka = true;
+//     status_tutup = false;
+
+//     // Simpan waktu saat servo dibuka
+//     waktuServoBuka = millis();
+
+//     lcd.clear();
+
+//     lcd.setCursor(0,0);
+//     lcd.print("Silakan Buang");
+
+//     lcd.setCursor(0,1);
+//     lcd.print("Sampah Anda");
+//   }
+
+//   // ================= TUTUP SERVO =================
+//   else if(
+//       sudahTerbuka &&
+//       statusPIR == LOW &&
+//       jarakManusia > 50 &&
+//       millis() - waktuServoBuka >= 5000
+//   ){
+
+//     Serial.println("🔒 Menutup Servo...");
+
+//     servo.write(0);
+
+//     sudahTerbuka = false;
+//     status_tutup = true;
+//   }
+// }
+
+  //   // LED mati
+  //   digitalWrite(LED, LOW);
+
+  //   // --- Deteksi warga ---
+  //   if(statusPIR == HIGH &&
+  //      jarakManusia < 20 &&
+  //      !sudahTerbuka){
+
+  //     Serial.println("⚠️ Membuka Servo...");
+
+  //     servo.write(90);
+
+  //     sudahTerbuka = true;
+  //     status_tutup = false;
+
+  //     waktuServoBuka = millis();
+
+  //     lcd.clear();
+
+  //     lcd.setCursor(0,0);
+  //     lcd.print("Silakan Buang");
+
+  //     lcd.setCursor(0,1);
+  //     lcd.print("Sampah Anda");
+  //   }
+
+  //   // --- Tutup otomatis ---
+  //   else if(sudahTerbuka &&
+  //           (jarakManusia >= 20 ||
+  //           millis() - waktuServoBuka >= JEDA_SERVO_TERBUKA)) {
+
+  //     Serial.println("🔒 Menutup Servo...");
+
+  //     servo.write(0);
+
+  //     sudahTerbuka = false;
+  //     status_tutup = true;
+  //   }
+  // }
+}
+
+   if(!sudahTerbuka) {
+
+  lcd.setCursor(0,0);
+
+  if (statusTPS == "TUTUP (PENUH)") {
+    lcd.print("TPS PENUH      ");
+  } 
+  
+  else if (statusTPS == "TUTUP (LUAR JAM OPERASIONAL)") {
+    lcd.print("TUTUP LUAR JAM ");
+  } 
+  
+  else {
+    lcd.print("TPS SEGIRI          ");
+  }
+
+  lcd.setCursor(0,1);
+
+  String baris2 = "Isi:" + String(persentaseIsi) + "%  ";
+
+  if (persentaseIsi >= 80) {
+    baris2 += "[FULL]";
+  } else {
+    baris2 += "[SEDIA]";
+  }
+
+  while(baris2.length() < 16){
+    baris2 += " ";
+  }
+
+  lcd.print(baris2);
+  }
+
+  // ===== 5. ALARM BROADCAST NOTIFIKASI KE BOT STAFF =====
+  if (persentaseIsi >= 80 && !notifPenuhTerkirim) {
+    if (chatIDStaffTujuan != "") {
+      String alarm = "🚨 *NOTIFIKASI PENGANGKUTAN SAMPAH!*\n\n";
+      alarm += "⚠️ Lokasi: TPS Pasar Segiri (Device 1)\n";
+      alarm += "📊 Kapasitas: Sudah mencapai " + String(persentaseIsi) + "%.\n";
+      alarm += "📢 Status Sistem: *TUTUP (PENUH)*.\n";
+      botStaff.sendMessage(chatIDStaffTujuan, alarm, "");
+    }
+    notifPenuhTerkirim = true; 
+  }
+  
+  if (persentaseIsi < 40 && notifPenuhTerkirim) {
+    if (chatIDStaffTujuan != "") {
+      String rilis = "✅ *INFO PEMULIHAN STATUS TPS*\n\n";
+      rilis += "TPS Pasar Segiri telah berhasil dikosongkan petugas (Kapasitas saat ini: " + String(persentaseIsi) + "%).\n";
+      botStaff.sendMessage(chatIDStaffTujuan, rilis, "");
+    }
+    notifPenuhTerkirim = false;
+  }
+
+  // ===== 6. SAMPLING CEK INTERAKSI CHAT TELEGRAM =====
+  if (millis() - waktuTerakhirCekBot > INTERVAL_CEK_BOT) {
+    cekBotWarga(); 
+    cekBotStaff(); 
+    waktuTerakhirCekBot = millis();
+  }
+
+  delay(10); 
+}
+}
